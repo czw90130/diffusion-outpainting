@@ -122,13 +122,17 @@ class InpaintingDataset(torch.utils.data.Dataset):
         return mask
 
 class InpaintingTrainer:
-    def __init__(self, model_name, dataset, tokenizer_manager, batch_size=1, device='cuda' if torch.cuda.is_available() else 'cpu'):
+    def __init__(self, model_name, dataset, tokenizer_manager, batch_size=1, only_local_files=False, device='cuda' if torch.cuda.is_available() else 'cpu'):
+        self.only_local_files = only_local_files # 设置是否仅使用本地文件
+        
+        self.base_model_name = model_name
+        
         self.dataset = dataset
         self.loader = DataLoader(dataset, batch_size, shuffle=True)
         self.tokenizer_manager = tokenizer_manager
         
         self.device = device
-        self._init_models(model_name)
+        self._init_models()
         self._init_scheduler()
 
     def _freeze_model_parameters(self, model, layers_to_freeze=[]):
@@ -158,11 +162,12 @@ class InpaintingTrainer:
         # img = self.image_processor.preprocess(img)
         return self.vae.encode(img).latent_dist.sample() * self.vae.config.scaling_factor
     
-    def _init_models(self, model_name):
+    def _init_models(self):
         # 加载并初始化模型
-        self.text_encoder = CLIPTextModel.from_pretrained(model_name, subfolder='text_encoder').to(self.device)
-        self.vae = AutoencoderKL.from_pretrained(model_name, subfolder='vae').to(self.device)
-        self.unet = UNet2DConditionModel.from_pretrained(model_name, subfolder='unet').to(self.device)
+        self.load_model()
+        self.getLatent_model()
+        self.load_text_encoder()
+        self.load_scheduler()
         
         # 调整文本编码器以适应新词
         self.text_encoder.resize_token_embeddings(len(self.tokenizer_manager.tokenizer))
@@ -188,38 +193,115 @@ class InpaintingTrainer:
             {'params': self.unet.parameters(), 'lr': 1e-4}
         ])
 
-    def _init_scheduler(self):
-        # 初始化噪声调度器
-        self.noise_scheduler = DDPMScheduler(beta_start=0.00085, beta_end=0.012, beta_schedule='scaled_linear', num_train_timesteps=1000, tensor_format='pt')
+    def addNoise(self, latent:torch.Tensor, noise: torch.Tensor, timestep:torch.Tensor):
+        """
+        向隐空间表示添加噪声。这一操作是图像生成过程的关键步骤之一，有助于引入随机性。
+
+        参数:
+        - latent: torch.Tensor, 当前的隐空间表示，它是图像在高维空间的表示形式。
+        - noise: torch.Tensor, 要添加到隐空间表示中的噪声。这个噪声通常是随机生成的，有助于在生成过程中引入变异。
+        - timestep: torch.Tensor, 当前的时间步。在随时间步进行的图像生成过程中，不同的时间步可能需要添加不同程度的噪声。
+
+        返回:
+        - torch.Tensor: 添加噪声后的新的隐空间表示。
+        """
+        # 使用DDIM调度器的add_noise方法将噪声添加到隐空间表示中。
+        # 这个方法根据当前时间步计算噪声的加权，确保噪声的添加与生成过程的阶段相匹配。
+        latent = self.ddim.add_noise(latent, noise, timestep)
+        # 对加入噪声后的隐空间表示进行缩放，使用init_noise_sigma进行调整。
+        # init_noise_sigma是一个预先定义的缩放因子，它根据模型的配置和训练过程中使用的噪声水平来设定。
+        latent = latent * self.ddim.init_noise_sigma
+    
+        return latent
+    
+    def load_model(self):
+        # 加载UNet模型
+        # 加载条件UNet模型用于图像生成
+        print(f"Loading UNet model from {self.base_model_name}...")
+        self.unet = UNet2DConditionModel.from_pretrained(self.base_model_name, 
+                                                            local_files_only = self.only_local_files, 
+                                                            torch_dtype=torch.float16, 
+                                                            # use_safetensors=True, 
+                                                            subfolder = "unet",
+                                                            cache_dir = self.cache_dir).cuda()
+        
+     
+        self.unet.enable_xformers_memory_efficient_attention()
+        print("UNet model loaded.")
+        
+    def getLatent_model(self):
+        # 加载VAE模型
+        # 加载VAE模型用于编码和解码图像到隐空间
+        print(f"Loading VAE model from {self.base_model_name}...")
+        MN = self.base_model_name
+        self.vae = AutoencoderKL.from_pretrained(MN, 
+                                                 local_files_only = self.only_local_files,
+                                                 torch_dtype=torch.float16,
+                                                #  use_safetensors=True,
+                                                 subfolder = "vae",
+                                                 cache_dir = self.cache_dir).cuda()
+        print("VAE model loaded.")
+        
+
+    def load_text_encoder(self):
+        # 加载文本编码器
+        # 加载CLIP的文本模型和分词器，用于将文本转换为嵌入向量
+        print(f"Loading text encoder from {self.base_model_name}...")
+        MN = self.base_model_name
+        self.text_encoder = CLIPTextModel.from_pretrained(MN, 
+                                                          local_files_only = self.only_local_files,
+                                                          torch_dtype=torch.float16,
+                                                        #   use_safetensors=True,
+                                                          subfolder = "text_encoder",
+                                                          cache_dir = self.cache_dir).cuda()
+    
+        self.tokenizer = CLIPTokenizer.from_pretrained(MN,
+                                                         local_files_only = self.only_local_files,
+                                                         subfolder = "tokenizer",
+                                                         cache_dir = self.cache_dir)
+        print("Text encoder loaded.")
+
+    def load_scheduler(self):
+        # 加载调度器
+        # 加载DDIMScheduler用于控制图像生成过程中的噪声减少步骤
+        print(f"Loading scheduler from {self.base_model_name}...")
+        MN = self.base_model_name
+        self.ddim = DDIMScheduler.from_pretrained(MN, 
+                                                  subfolder="scheduler", 
+                                                  local_files_only=self.only_local_files, 
+                                                #   torch_dtype=torch.float16, 
+                                                  use_safetensors=True, 
+                                                  cache_dir = self.cache_dir)
     
     def forward(self, data):
         """
         根据给定的数据进行一次前向传播，并计算损失。
         """
-        # 使用vae压缩原图像
-        # [1, 3, 512, 512] -> [1, 4, 64, 64]
-        latents = self.getImgLatent(data['pixel'].to(self.device))
-        masked_latent = self.getImgLatent(data['masked_pixel'].to(self.device))
+        # 使用VAE模型将图像编码到隐空间
+        # [b, 3, 512, 512] -> [b, 4, 64, 64]
+        latent_model_input = self.getImgLatent(data['pixel'].to(self.device))
+        masked_latent_input = self.getImgLatent(data['masked_pixel'].to(self.device))
 
         # 为inpainting任务引入遮罩处理，将遮罩调整为与隐空间(latents)相同的尺寸
-        mask = data['mask'].to(self.device)
-        mask = torch.nn.functional.interpolate(mask.float(), size=(latents.shape[2], latent.shape[3]), mode='nearest')
+        mask_input = data['mask'].to(self.device)
+        mask_input = torch.nn.functional.interpolate(mask_input.float(), size=(latent_model_input.shape[2], latent_model_input.shape[3]), mode='nearest')
         # mask = torch.nn.functional.interpolate(mask, size=(64, 64), mode='nearest')
         
         # 将遮罩应用到隐空间表示上，模拟inpainting任务中被遮挡的区域
         # 这里简单地将遮罩区域的隐空间表示置零
-        masked_latents = latents * (mask_resized < 0.5)
+        
+        latent_model_input = torch.cat([latent_model_input, mask_input, masked_latent_input], dim=1)     # inpaint模型拥有额外的输入信息，通道数为9
 
         # 随机b张噪声图
-        # [1, 4, 64, 64]
-        noise = torch.randn(latents.shape).to(self.device)
+        # [b, 4, 64, 64]
+        noise = torch.randn(latent_model_input.shape).to(self.device)
 
         # 随机采样0-1000之间的b个数字，为每张图片随机一个步数
         # [1]
         timesteps = torch.randint(0, 1000, (1, ), device=self.device).long()
 
         # 把噪声添加到压缩图中，维度不变
-        noisy_latents = self.noise_scheduler.add_noise(masked_latents, noise, timesteps)
+        noisy_latents = self.addNoise(latent_model_input, noise, timesteps)
 
         # 编码文字
         # [1, 77, 768]
@@ -227,9 +309,10 @@ class InpaintingTrainer:
 
         # 根据文字信息，从混合图中把噪声图给抽取出来
         # [1, 4, 64, 64]
-        noise_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states, mask=mask).sample
+        noise_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states = encoder_hidden_states).sample
 
         # 求mse loss即可
+        actual_noise = noisy_latents - latent_model_input  # 实际噪声是加噪后的表示与原始表示的差
         # [1, 4, 64, 64]
         loss = torch.nn.functional.mse_loss(noise_pred, noise, reduction='none')
         # [1, 4, 64, 64] -> [1]

@@ -39,7 +39,7 @@ class ImageExtension():
     """
     # 设置默认模型路径和本地缓存路径
     DEFAULT_MODEL = "stabilityai/stable-diffusion-2-inpainting"
-    cache_dir = "F:/huggingface_model/"    # diffusers的本地缓存路径
+    cache_dir = "./huggingface_model/"    # diffusers的本地缓存路径
     def __init__(self, 
                  sampleTimeStep:int = 30, 
                  only_local_files:bool = False):
@@ -50,20 +50,25 @@ class ImageExtension():
         - sampleTimeStep: int, 定义采样过程中使用的时间步长，默认为30。
         - only_local_files: bool, 指定是否仅使用本地文件加载模型，以避免从网络下载，默认为False。
         """
+        print("Initializing ImageExtension...")
         # 初始化模型参数
         self.base_model_name = self.DEFAULT_MODEL # 指定使用的模型
         self.only_local_files = only_local_files # 设置是否仅使用本地文件
-        set_step(sampleTimeStep) # 设置采样时间步长
+        self.sampleTimeStep = sampleTimeStep
 
         # 加载必要的模型和组件
         self.load_model()  # 加载条件UNet模型
         self.getLatent_model()  # 加载VAE模型，用于图像的编码和解码
         self.load_text_encoder()  # 加载文本编码器，用于处理文本提示
         self.load_scheduler()  # 加载调度器，用于控制图像生成过程中的时间步
+
+        self.set_step(sampleTimeStep) # 设置采样时间步长
         
         self.allTimestep = self.ddim.timesteps  # 获取调度器定义的所有时间步
+        print(f"All time steps: {self.allTimestep}")
 
         self.image_processor = VaeImageProcessor()  # 初始化图像处理器，用于预处理和后处理图像
+        print("ImageExtension initialized successfully.")
 
 
     def addNoise(self, latent:torch.Tensor, noise: torch.Tensor, timestep:torch.Tensor):
@@ -89,9 +94,11 @@ class ImageExtension():
     
     def set_step(self, sampleTimeStep:int):
         # 设置采样时间步
+        print(f"Setting sample time step to {sampleTimeStep}...")
         self.sampleTimeStep = sampleTimeStep
         self.ddim.set_timesteps(self.sampleTimeStep, device="cuda:0")
         self.allTimestep = self.ddim.timesteps
+        print(f"Sample time step set to {self.sampleTimeStep}.")
     
         
     def sample_step(self, latent: torch.Tensor, niose: torch.Tensor, timestep: torch.Tensor):
@@ -131,7 +138,7 @@ class ImageExtension():
         masked_latent_input = torch.cat([masked_latent]*2)
 
         # 调整输入数据的尺寸并合并，以符合模型的输入格式
-        latent_model_input = self.ddim.scale_model_input(latent_model_input, timestep)
+        # latent_model_input = self.ddim.scale_model_input(latent_model_input, timestep)
         latent_model_input = torch.cat([latent_model_input, mask_input, masked_latent_input], dim=1)     # inpaint模型拥有额外的输入信息，通道数为9
         
         # 通过UNet模型预测噪声，并根据指导比例调整
@@ -193,6 +200,7 @@ class ImageExtension():
     def load_scheduler(self):
         # 加载调度器
         # 加载DDIMScheduler用于控制图像生成过程中的噪声减少步骤
+        print(f"Loading scheduler from {self.base_model_name}...")
         MN = self.base_model_name
         self.ddim = DDIMScheduler.from_pretrained(MN, 
                                                   subfolder="scheduler", 
@@ -203,10 +211,12 @@ class ImageExtension():
         
 
         self.ddim.set_timesteps(self.sampleTimeStep, device="cuda:0")
+        print("Scheduler loaded.")
 
     def load_model(self):
         # 加载UNet模型
         # 加载条件UNet模型用于图像生成
+        print(f"Loading UNet model from {self.base_model_name}...")
         self.unet = UNet2DConditionModel.from_pretrained(self.base_model_name, 
                                                             local_files_only = self.only_local_files, 
                                                             torch_dtype=torch.float16, 
@@ -216,10 +226,12 @@ class ImageExtension():
         
      
         self.unet.enable_xformers_memory_efficient_attention()
+        print("UNet model loaded.")
         
     def getLatent_model(self):
         # 加载VAE模型
         # 加载VAE模型用于编码和解码图像到隐空间
+        print(f"Loading VAE model from {self.base_model_name}...")
         MN = self.base_model_name
         self.vae = AutoencoderKL.from_pretrained(MN, 
                                                  local_files_only = self.only_local_files,
@@ -227,11 +239,13 @@ class ImageExtension():
                                                 #  use_safetensors=True,
                                                  subfolder = "vae",
                                                  cache_dir = self.cache_dir).cuda()
+        print("VAE model loaded.")
         
 
     def load_text_encoder(self):
         # 加载文本编码器
         # 加载CLIP的文本模型和分词器，用于将文本转换为嵌入向量
+        print(f"Loading text encoder from {self.base_model_name}...")
         MN = self.base_model_name
         self.text_encoder = CLIPTextModel.from_pretrained(MN, 
                                                           local_files_only = self.only_local_files,
@@ -244,6 +258,7 @@ class ImageExtension():
                                                          local_files_only = self.only_local_files,
                                                          subfolder = "tokenizer",
                                                          cache_dir = self.cache_dir)
+        print("Text encoder loaded.")
         
         
     @staticmethod
@@ -263,7 +278,7 @@ class ImageExtension():
     
     def encode_prompt(self, prompt:str, neg_prompt:str = None):
         # 编码文本提示
-        # 将正面和负面提示编码为嵌入向量
+        # 将正面提示编码为嵌入向量
         text_input_ids = self.tokenize_prompt(self.tokenizer, prompt)
 
         prompt_embeds = self.text_encoder(
@@ -276,6 +291,7 @@ class ImageExtension():
 
         if neg_prompt is None:
             neg_prompt = ""
+        # 负面提示编码为嵌入向量
         negative_text_input_ids = self.tokenize_prompt(self.tokenizer, neg_prompt)
         negative_prompt_embeds = self.text_encoder(
             negative_text_input_ids.to(self.text_encoder.device),
